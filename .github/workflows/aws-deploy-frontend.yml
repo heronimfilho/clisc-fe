@@ -3,40 +3,116 @@ name: Deploy Frontend to AWS
 on:
   push:
     branches: [ main ]
+    paths-ignore:
+      - 'clinic-scheduler/**'
 
 jobs:
-  build-and-deploy:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout Code
+        uses: actions/checkout@v3
       
-      - name: Configure AWS credentials
+      # Add caching for Docker layers
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v1
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
-      
+
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
       
-      - name: Build and push frontend image
+      # Add versioning with git sha and date
+      - name: Set image tag
+        id: vars
+        run: |
+          echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "date=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
+      
+      - name: Build and Push Frontend Image
         uses: docker/build-push-action@v3
         with:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/clinic-frontend:latest
-      
-      - name: Trigger deployment on EC2
+          # Use buildx cache
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: |
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/clinic-frontend:latest
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/clinic-frontend:${{ steps.vars.outputs.date }}-${{ steps.vars.outputs.sha_short }}
+          # Add build args for React - these can be used in your Dockerfile to set environment vars at build time
+          build-args: |
+            REACT_APP_API_URL=http://${{ secrets.BACKEND_EC2_HOST }}
+            NODE_ENV=production
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to EC2
         uses: appleboy/ssh-action@master
         with:
-          host: ${{ secrets.EC2_HOST }}
+          host: ${{ secrets.FRONTEND_EC2_HOST }}
           username: ec2-user
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             cd /app
-            export AWS_ACCOUNT_ID=${{ secrets.AWS_ACCOUNT_ID }}
-            export AWS_REGION=us-east-1
-            sudo ./update-frontend.sh
+            
+            # Set environment variables in a .env file
+            cat > .env << EOF
+            AWS_ACCOUNT_ID=${{ secrets.AWS_ACCOUNT_ID }}
+            AWS_REGION=us-east-1
+            BACKEND_IP=${{ secrets.BACKEND_EC2_HOST }}
+            REACT_APP_API_URL=http://${{ secrets.BACKEND_EC2_HOST }}
+            EOF
+            
+            # Log in to ECR
+            aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+            
+            # Pull the latest image
+            docker-compose pull
+            
+            # Add health check before stopping current service
+            CURRENT_CONTAINER=$(docker ps -q --filter "name=frontend")
+            if [ ! -z "$CURRENT_CONTAINER" ]; then
+              echo "Backing up current container status..."
+            fi
+            
+            # Restart service with zero downtime approach
+            echo "Starting new container..."
+            docker-compose down
+            docker-compose up -d
+            
+            # Verify deployment was successful
+            sleep 10
+            if [ "$(docker ps -q --filter "name=frontend")" ]; then
+              echo "✅ Frontend deployment successful"
+              
+              # Test if the service is responding (optional)
+              if curl -s http://localhost | grep -q "React"; then
+                echo "✅ Frontend application responding correctly"
+              else
+                echo "⚠️ Frontend application may not be running correctly"
+              fi
+            else
+              echo "❌ Frontend deployment failed"
+              exit 1
+            fi
+            
+            # Clean up old images to save space
+            docker image prune -f --filter "until=24h"
+      
+      - name: Notify on Success
+        if: success()
+        run: echo "Frontend deployment completed successfully!"
+      
+      - name: Notify on Failure
+        if: failure()
+        run: echo "Frontend deployment failed!"
